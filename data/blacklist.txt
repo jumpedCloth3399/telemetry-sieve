@@ -1,0 +1,4 @@
+telemetry.microsoft.com
+v10.events.data.microsoft.com
+doubleclick.net
+analytics.google.com
