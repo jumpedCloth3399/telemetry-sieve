@@ -1,5 +1,11 @@
 import os
-from scapy.all import sniff, DNS, DNSQR, IP, UDP
+from datetime import datetime
+
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
+from scapy.all import DNS, DNSQR, IP, sniff
 
 # BPF filter: restrict capture to outbound UDP packets destined for port 53.
 # This is evaluated in-kernel before Scapy ever receives the frame, keeping
@@ -7,6 +13,27 @@ from scapy.all import sniff, DNS, DNSQR, IP, UDP
 BPF_FILTER = "udp and dst port 53"
 
 BLACKLIST_PATH = os.path.join("data", "blacklist.txt")
+
+console = Console()
+
+
+def build_table() -> Table:
+    """
+    Construct and return a fresh Rich Table with all column definitions.
+    Called once at startup; rows are appended to this instance at runtime.
+    """
+    table = Table(
+        title="[bold white]Telemetry Sieve — Live DNS Monitor[/bold white]",
+        show_header=True,
+        header_style="bold white",
+        border_style="bright_black",
+        expand=True,
+    )
+    table.add_column("Time",          style="cyan",    no_wrap=True, width=12)
+    table.add_column("Source IP",     style="magenta", no_wrap=True, width=18)
+    table.add_column("Target Domain", style="yellow",  no_wrap=False)
+    table.add_column("Status",        no_wrap=True,    width=16)
+    return table
 
 
 def load_blacklist(path: str) -> set[str]:
@@ -26,18 +53,18 @@ def load_blacklist(path: str) -> set[str]:
                 if line.strip() and not line.strip().startswith("#")
             }
         if not domains:
-            print(f"[!] Warning: blacklist file '{path}' exists but contains no entries.")
+            console.print(f"[yellow][!] Warning: blacklist file '{path}' exists but contains no entries.[/yellow]")
             return set()
 
-        print(f"[*] Blacklist loaded — {len(domains)} domain(s) from '{path}'")
+        console.print(f"[green][*] Blacklist loaded — {len(domains)} domain(s) from '{path}'[/green]")
         return domains
 
     except FileNotFoundError:
-        print(f"[!] Warning: blacklist file not found at '{path}'. Running with empty blocklist.")
+        console.print(f"[yellow][!] Warning: blacklist file not found at '{path}'. Running with empty blocklist.[/yellow]")
         return set()
 
 
-def process_packet(packet: object, blacklist: set[str] = set()) -> None:
+def process_packet(packet: object, table: Table, blacklist: set[str]) -> None:
     """
     Callback invoked by sniff() for every packet that passes the BPF filter.
 
@@ -76,38 +103,46 @@ def process_packet(packet: object, blacklist: set[str] = set()) -> None:
     domain = raw_qname.decode("utf-8", errors="replace").rstrip(".")
 
     src_ip = packet[IP].src if packet.haslayer(IP) else "unknown"
+    timestamp = datetime.now().strftime("%H:%M:%S")
 
     # Set membership test is O(1) — no performance penalty even on large blocklists.
     if domain.lower() in blacklist:
-        print(f"[TRACKER BLOCKED]  {src_ip}  →  {domain}")
+        status = Text("⬤ BLOCKED", style="bold red")
     else:
-        print(f"[DNS Query]        {src_ip}  →  {domain}")
+        status = Text("⬤ ALLOWED", style="bold green")
+
+    table.add_row(timestamp, src_ip, domain, status)
 
 
 def main() -> None:
     blacklist = load_blacklist(BLACKLIST_PATH)
+    table = build_table()
 
-    print("[*] Telemetry Sieve — DNS capture starting (Ctrl+C to stop) …")
-    print(f"[*] Active BPF filter: '{BPF_FILTER}'\n")
+    console.print("[bold cyan][*] Telemetry Sieve — DNS capture starting (Ctrl+C to stop) …[/bold cyan]")
+    console.print(f"[dim][*] Active BPF filter: '{BPF_FILTER}'[/dim]\n")
 
-    # Bind the loaded blacklist into the callback via a closure so sniff()
+    # Bind the table and blacklist into the callback via a closure so sniff()
     # can call process_packet(packet) with the standard single-argument
-    # signature it expects, while the blocklist remains accessible.
+    # signature it expects, while both shared objects remain accessible.
     def packet_handler(packet: object) -> None:
-        process_packet(packet, blacklist)
+        process_packet(packet, table, blacklist)
 
     try:
-        # store=False discards each packet from memory after the callback
-        # returns, preventing unbounded RAM growth during long capture sessions.
-        sniff(
-            filter=BPF_FILTER,
-            prn=packet_handler,
-            store=False,
-        )
+        # Live redraws the table in-place at up to 4 fps; no line-spam.
+        # The table reference is shared with packet_handler, so every
+        # table.add_row() call is reflected on the next refresh cycle.
+        with Live(table, console=console, refresh_per_second=4):
+            # store=False discards each packet from memory after the callback
+            # returns, preventing unbounded RAM growth during long capture sessions.
+            sniff(
+                filter=BPF_FILTER,
+                prn=packet_handler,
+                store=False,
+            )
     except KeyboardInterrupt:
         # Scapy closes its raw socket internally when sniff() unwinds;
         # this block ensures we exit cleanly without a traceback.
-        print("\n[*] Capture interrupted — sockets closed. Goodbye.")
+        console.print("\n[bold cyan][*] Capture interrupted — sockets closed. Goodbye.[/bold cyan]")
 
 
 if __name__ == "__main__":
